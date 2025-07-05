@@ -15,7 +15,7 @@ const CONFIG = {
 
     // Trading Parameters
     SYMBOL: process.env.SYMBOL || 'ETH-USDT',
-    QUOTE_CURRENCY_TRADE_AMOUNT: parseFloat(process.env.QUOTE_CURRENCY_TRADE_AMOUNT) || 1,
+    BASE_CURRENCY_TRADE_AMOUNT: parseFloat(process.env.BASE_CURRENCY_TRADE_AMOUNT) || 0.0001, // 0.0001 ETH
     PROFIT_PERCENTAGE_PER_TRADE: parseFloat(process.env.PROFIT_PERCENTAGE_PER_TRADE) || 0.2,
     DCA_BUY_PERCENTAGE_BELOW: parseFloat(process.env.DCA_BUY_PERCENTAGE_BELOW) || 0.3,
 
@@ -49,6 +49,10 @@ class OKXTradingBot {
         this.isReconnecting = false;
         this.pendingOrderOperations = new Set();
 
+        // Event-driven Aggressive Buy State
+        this.isInAggressiveBuyMode = false;
+        this.aggressiveBuyRetryTimeout = null;
+
         // Components
         this.axiosInstance = this.createAxiosInstance();
 
@@ -68,7 +72,7 @@ class OKXTradingBot {
             timeout: CONFIG.HTTP_TIMEOUT_MS,
             headers: {
                 'Content-Type': 'application/json',
-                'User-Agent': 'OKX-Enhanced-Bot/2.0',
+                'User-Agent': 'OKX-Enhanced-Bot/3.0',
                 'Connection': 'keep-alive'
             }
         });
@@ -119,9 +123,9 @@ class OKXTradingBot {
         return Math.round(size / lotSize) * lotSize;
     }
 
+    // ✅ Updated to use fixed BASE_CURRENCY_TRADE_AMOUNT
     calculateTradeSize(price) {
-        const baseSize = CONFIG.QUOTE_CURRENCY_TRADE_AMOUNT / price;
-        return this.roundSize(baseSize);
+        return this.roundSize(CONFIG.BASE_CURRENCY_TRADE_AMOUNT);
     }
 
     // Enhanced API request with better error handling
@@ -321,12 +325,13 @@ class OKXTradingBot {
             // Reconnect after checking
             setTimeout(() => {
                 this.reconnectPrivateWebSocket();
-            }, 500);
+            }, 1000);
+
         } catch (error) {
             this.error('Error handling WebSocket disconnect:', error.message);
             setTimeout(() => {
                 this.reconnectPrivateWebSocket();
-            }, 500);
+            }, 2000);
         }
     }
 
@@ -687,9 +692,18 @@ class OKXTradingBot {
 
         this.log(`Buy filled: ${fillSize} @ ${fillPrice}`);
 
-        // Clear current aggressive buy order if this was it
+        // ✅ Clear aggressive buy state
         if (this.currentAggressiveBuyOrder?.orderId === orderUpdate.ordId) {
             this.currentAggressiveBuyOrder = null;
+            this.isInAggressiveBuyMode = false;
+
+            // Clear retry timeout
+            if (this.aggressiveBuyRetryTimeout) {
+                clearTimeout(this.aggressiveBuyRetryTimeout);
+                this.aggressiveBuyRetryTimeout = null;
+            }
+
+            this.log('Aggressive buy cycle completed - order filled');
         }
 
         try {
@@ -734,26 +748,31 @@ class OKXTradingBot {
         if (sellOrderInfo) {
             const profit = (fillPrice - sellOrderInfo.buyPrice) * fillSize;
             this.totalRealizedProfit += profit;
-            this.openSellOrders.delete(orderId);
+            this.openSellOrders.delete(orderId); // Remove filled order first
             this.log(`Profit realized: ${profit.toFixed(8)} (Total: ${this.totalRealizedProfit.toFixed(8)})`);
         }
 
         try {
-            // Immediate re-entry buy at the exact sell price
-            await this.placeOrder('buy', fillPrice, fillSize);
-            this.log(`Re-entry buy order placed: ${fillSize} @ ${fillPrice}`);
+            // ✅ Check if all sell orders are filled
+            if (this.openSellOrders.size === 0) {
+                this.log('🎯 All sell orders filled! Returning to aggressive buy cycle...');
 
-            // Check if we should return to aggressive buying
-            setTimeout(() => {
-                if (this.openSellOrders.size === 0) {
-                    this.log('No higher pending sells exist, returning to aggressive buy cycle');
-                    this.startAggressiveBuyCycle();
-                } else {
-                    this.log(`${this.openSellOrders.size} higher pending sells exist, staying in monitoring mode`);
-                }
-            }, 1000);
+                // ✅ Start aggressive buy immediately
+                this.startAggressiveBuyCycle();
+
+            } else {
+                // Still have sell orders - just log status
+                const remainingSells = Array.from(this.openSellOrders.values())
+                    .map(order => order.price)
+                    .sort((a, b) => b - a);
+
+                this.log(`💰 Sell order filled at ${fillPrice}, but ${this.openSellOrders.size} higher sell orders remain`);
+                this.log(`📊 Remaining sell orders: [${remainingSells.join(', ')}]`);
+                this.log(`⏳ Waiting for higher sells to fill before returning to aggressive buying...`);
+            }
+
         } catch (error) {
-            this.error('Failed to place re-entry buy order:', error.message);
+            this.error('Failed to process sell fill logic:', error.message);
         }
     }
 
@@ -777,50 +796,85 @@ class OKXTradingBot {
         }
     }
 
-    // Enhanced aggressive buy cycle with WebSocket price priority
+    // ✅ Event-driven aggressive buy cycle
     async startAggressiveBuyCycle() {
-        if (this.isShuttingDown) return;
+        if (this.isShuttingDown || this.isInAggressiveBuyMode) return;
 
         this.log('Starting aggressive buy cycle...');
+        this.isInAggressiveBuyMode = true;
 
-        while (!this.isShuttingDown) {
-            try {
-                // Use WebSocket price with fallback
-                let currentPrice = this.lastKnownPrice;
-                if (!currentPrice) {
-                    this.log('Waiting for price data from WebSocket...');
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                    continue;
+        await this.attemptAggressiveBuy();
+    }
+
+    async attemptAggressiveBuy() {
+        if (this.isShuttingDown || !this.isInAggressiveBuyMode) return;
+
+        try {
+            // ✅ Get current price với immediate fallback
+            let currentPrice = this.lastKnownPrice;
+
+            if (!currentPrice) {
+                this.log('No WebSocket price available, fetching from API...');
+                try {
+                    currentPrice = await this.getCurrentPrice();
+                    this.updatePrice(currentPrice);
+                } catch (error) {
+                    this.error('Failed to get current price:', error.message);
+                    this.scheduleAggressiveBuyRetry(1000);
+                    return;
                 }
-
-                const tradeSize = this.calculateTradeSize(currentPrice);
-                const buyOrder = await this.placeOrder('buy', currentPrice, tradeSize);
-                this.currentAggressiveBuyOrder = buyOrder;
-
-                this.log(`Aggressive buy order placed: ${tradeSize} @ ${currentPrice} (from WebSocket)`);
-
-                // Wait for immediate fill
-                await new Promise(resolve => setTimeout(resolve, CONFIG.IMMEDIATE_BUY_WAIT_MS));
-
-                // Check if order is still pending
-                const openOrders = await this.getOpenOrders();
-                const orderStillPending = openOrders.find(order => order.ordId === buyOrder.orderId);
-
-                if (orderStillPending) {
-                    await this.cancelOrder(buyOrder.orderId, buyOrder.clientOrderId);
-                    this.currentAggressiveBuyOrder = null;
-                    this.log('Aggressive buy order not filled immediately, cancelled and retrying...');
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                } else {
-                    this.log('Aggressive buy order filled, exiting aggressive buy cycle');
-                    this.currentAggressiveBuyOrder = null;
-                    break;
-                }
-            } catch (error) {
-                this.error('Error in aggressive buy cycle:', error.message);
-                await new Promise(resolve => setTimeout(resolve, 1000));
             }
+
+            const tradeSize = this.calculateTradeSize(currentPrice);
+            const buyOrder = await this.placeOrder('buy', currentPrice, tradeSize);
+            this.currentAggressiveBuyOrder = buyOrder;
+
+            this.log(`Aggressive buy order placed: ${tradeSize} @ ${currentPrice}`);
+
+            // ✅ Schedule timeout check
+            this.aggressiveBuyRetryTimeout = setTimeout(() => {
+                this.handleAggressiveBuyTimeout();
+            }, CONFIG.IMMEDIATE_BUY_WAIT_MS);
+
+        } catch (error) {
+            this.error('Error in aggressive buy attempt:', error.message);
+            this.scheduleAggressiveBuyRetry(1000);
         }
+    }
+
+    async handleAggressiveBuyTimeout() {
+        if (this.isShuttingDown || !this.isInAggressiveBuyMode) return;
+
+        // ✅ Check internal state instead of REST API
+        if (this.currentAggressiveBuyOrder) {
+            this.log('Aggressive buy order timeout, cancelling and retrying...');
+
+            try {
+                await this.cancelOrder(
+                    this.currentAggressiveBuyOrder.orderId,
+                    this.currentAggressiveBuyOrder.clientOrderId
+                );
+                this.currentAggressiveBuyOrder = null;
+
+                // ✅ Quick retry
+                this.scheduleAggressiveBuyRetry(50);
+            } catch (error) {
+                this.error('Error cancelling aggressive buy order:', error.message);
+                this.scheduleAggressiveBuyRetry(1000);
+            }
+        } else {
+            // Order already filled via WebSocket
+            this.log('Aggressive buy order filled via WebSocket during timeout period');
+            this.isInAggressiveBuyMode = false;
+        }
+    }
+
+    scheduleAggressiveBuyRetry(delayMs) {
+        if (this.isShuttingDown || !this.isInAggressiveBuyMode) return;
+
+        this.aggressiveBuyRetryTimeout = setTimeout(() => {
+            this.attemptAggressiveBuy();
+        }, delayMs);
     }
 
     // Enhanced cancel all orders
@@ -850,6 +904,13 @@ class OKXTradingBot {
             this.currentAggressiveBuyOrder = null;
             this.totalRealizedProfit = 0;
             this.pendingOrderOperations.clear();
+            this.isInAggressiveBuyMode = false;
+
+            // Clear any pending timeouts
+            if (this.aggressiveBuyRetryTimeout) {
+                clearTimeout(this.aggressiveBuyRetryTimeout);
+                this.aggressiveBuyRetryTimeout = null;
+            }
 
             this.log('All orders cancelled, starting aggressive buy cycle...');
             this.startAggressiveBuyCycle();
@@ -863,6 +924,13 @@ class OKXTradingBot {
 
         this.log('Initiating graceful shutdown...');
         this.isShuttingDown = true;
+        this.isInAggressiveBuyMode = false;
+
+        // Clear aggressive buy timeout
+        if (this.aggressiveBuyRetryTimeout) {
+            clearTimeout(this.aggressiveBuyRetryTimeout);
+            this.aggressiveBuyRetryTimeout = null;
+        }
 
         try {
             // Wait for pending operations
@@ -903,9 +971,9 @@ class OKXTradingBot {
     // Enhanced startup
     async start() {
         try {
-            this.log('=== OKX Enhanced Grid Trading Bot Starting ===');
+            this.log('=== OKX Enhanced Grid Trading Bot v3.0 Starting ===');
             this.log(`Trading pair: ${CONFIG.SYMBOL}`);
-            this.log(`Trade amount: ${CONFIG.QUOTE_CURRENCY_TRADE_AMOUNT} (quote currency)`);
+            this.log(`Trade amount: ${CONFIG.BASE_CURRENCY_TRADE_AMOUNT} ETH (base currency)`);
             this.log(`Profit target: ${CONFIG.PROFIT_PERCENTAGE_PER_TRADE}%`);
             this.log(`DCA percentage: ${CONFIG.DCA_BUY_PERCENTAGE_BELOW}%`);
 
@@ -925,6 +993,10 @@ class OKXTradingBot {
             // Get initial price
             this.lastKnownPrice = await this.getCurrentPrice();
             this.log(`Current ${CONFIG.SYMBOL} price: ${this.lastKnownPrice}`);
+
+            // Log estimated order value
+            const estimatedValue = CONFIG.BASE_CURRENCY_TRADE_AMOUNT * this.lastKnownPrice;
+            this.log(`Estimated order value: ${estimatedValue.toFixed(2)} USDT per trade`);
 
             // Setup WebSockets
             await this.setupWebSockets();
